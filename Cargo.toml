@@ -1,0 +1,15 @@
+[package]
+name = "mipoint-dummy-generator"
+version = "0.1.0"
+edition = "2021"
+description = "Generate synthetic business folder structures and Office documents for migration testing"
+license = "MIT"
+
+[[bin]]
+name = "mipoint-dummy-generator"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
+rfd = "0.17"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
