@@ -9,9 +9,9 @@ A Windows GUI for creating realistic, repeatable synthetic business datasets for
 3. Choose the file count, folder depth, seed, file types and sizes.
 4. Select **Generate dataset**. Use **Open output folder** to inspect the result.
 
-Press **F1** or select **Help (F1)** for detailed generation rules. The interface switches from two columns to stacked sections in narrower windows. Scroll vertically to reach all controls. Clipboard paste and Windows accessibility support are enabled.
+Click **Configuration** to collapse or expand all settings. Progress, pause and resume controls remain visible. Press **F1** or select **Help (F1)** for detailed generation rules. The interface switches from two columns to stacked sections in narrower windows. Scroll vertically to reach all controls. Clipboard paste and Windows accessibility support are enabled.
 
-Each run creates a new `Dataset-<seed>` folder, adding a numeric suffix if needed. Existing datasets are preserved. **Stop after current file** retains complete files and their inventory. Closing the window during generation finishes the current file and flushes the inventory before closing.
+Each run creates a unique `Dataset-<seed>-<run ID>` folder. Existing datasets are preserved. **Pause dataset** finishes the current file or interrupts retry waiting, then retains a local checkpoint. Closing during generation follows the same pause path before the window closes.
 
 ## Settings
 
@@ -22,6 +22,7 @@ Each run creates a new `Dataset-<seed>` folder, adding a numeric suffix if neede
 | Maximum depth | 1 to 12 folders below the run folder, including the organisation. Default 7. |
 | Random seed | Blank chooses a time-derived seed and displays it. Any unsigned 64-bit integer, including zero, is accepted. |
 | Inventory | Enabled by default; one row per completed content file. |
+| Network retry window | Default 120 seconds; editable from 5 to 3600 seconds. Retries every 5 seconds, then pauses. |
 | Average size | Default 4.8 MB. |
 | Minimum / maximum | Default 1 / 15 MB. Each size setting supports 0.1 to 256 MB. |
 
@@ -52,17 +53,32 @@ Business profiles link divisions, departments, teams and processes. At depth 7, 
 
 Shallower files stop earlier; deeper paths add working-record folders. Depth varies from min(3, maximum) to the maximum. Names combine a record ID, a title appropriate to the business area and format, and a review status. Owners are labelled synthetic.
 
-The same seed and all the same settings in version 0.2.0 reproduce relative paths, file bytes, sizes and inventory. Run folder suffixes and filesystem creation/modification times may differ. Different versions need not reproduce earlier output. The app does not upload generated data.
+The same seed and all the same settings in version 0.3.0 reproduce relative paths, file bytes, sizes and inventory. Run folder suffixes and filesystem creation/modification times may differ. Different versions need not reproduce earlier output. The app does not upload generated data.
 
 ## Inventory
 
 `Structure Inventory.csv` uses UTF-8 with BOM for Excel. Paths are relative to the run folder, with `/` separators. The five structure fields are `RelativePath`, `FileName`, `Extension`, `SizeBytes` and `FolderDepth`.
 
-Ten synthetic metadata fields follow: `RecordID`, `BusinessUnit`, `Department`, `Team`, `BusinessProcess`, `FinancialYear`, `RecordCategory`, `Owner`, `Status` and `Classification`. Metadata is recorded in the CSV; it is not applied as filesystem attributes or Office custom properties. The inventory is buffered and flushed at completion or normal cancellation. Errors retain the partial dataset and report its location.
+Ten synthetic metadata fields follow: `RecordID`, `BusinessUnit`, `Department`, `Team`, `BusinessProcess`, `FinancialYear`, `RecordCategory`, `Owner`, `Status` and `Classification`. Metadata is recorded in the CSV; it is not applied as filesystem attributes or Office custom properties. The inventory journal is saved locally after each complete file. Its CSV is published to the destination on completion or a normal pause when the destination is reachable. During an outage, the latest complete inventory remains in the local saved-job folder as `inventory-journal.csv`. Resuming publishes the network inventory without duplicate rows.
 
 ## Progress
 
-The background worker reports completed files and bytes. The GUI shows elapsed time, MB/s and an estimated remaining time based on written bytes. ETA appears after work begins and varies with disk performance. Completion reports actual count, size, average and seed. Failed or stopped runs retain completed files for inspection.
+The background worker reports completed files and bytes. The GUI shows elapsed time, MB/s and an estimated remaining time based on written bytes. ETA appears after work begins and varies with disk performance. Completion reports actual count, size, average and seed. A resumed session measures throughput from newly written bytes, excluding bytes from earlier sessions. Paused runs retain completed files and their local saved job.
+
+## Network outages, pause and resume
+
+Transient network failures are retried every 5 seconds for the selected retry window, defaulting to 120 seconds from the first returned error. The GUI reports attempts and elapsed retry time. If the share recovers, generation continues automatically. If the window expires, the job pauses. Permission problems, a full disk or conflicting existing content pause immediately so they can be corrected.
+
+- In the same session, reconnect the destination and select **Resume paused dataset**.
+- After restarting the app, select **Open saved dataset...**, then choose the matching saved-job folder under `%LOCALAPPDATA%\MiPoint Generator\Checkpoints`. The local folder name matches the output dataset folder name. Original settings and progress are restored automatically.
+- Reconnect mapped drives with the same drive letter before resuming. UNC paths avoid drive-letter differences between sessions.
+- Keep the saved-job folder until the dataset is complete. It contains two integrity-checked checkpoint slots, a local inventory journal and the job lock. Resume requires this local state, not just the destination files. Jobs are not removed automatically.
+
+Each content file is written to a temporary sibling, flushed and then renamed into place. Only published files advance the local checkpoint. A lost write acknowledgement is handled by checking the expected bytes of that pending file. Differing existing content is preserved and the job pauses. A corrupt or torn checkpoint can fall back to the previous valid slot; an uncommitted inventory tail is discarded on resume. Only one worker can run a saved job at a time.
+
+Windows file operations may block on OS/SMB timeouts before returning an error. The app cannot interrupt an outstanding Windows call; **Pause dataset** interrupts retry waiting and waits for any outstanding call/current file. The configured window is a retry budget, not a hard wall-clock timeout for a stalled OS call.
+
+Previously generated version 0.2.0 datasets have no saved checkpoints and cannot be resumed with this feature. Resume assumes the destination retains previously acknowledged files; it does not audit every completed file for subsequent external deletion or modification. Checkpoints belong to this generation format and should be resumed using the same app version.
 
 ## Build and package on Windows
 

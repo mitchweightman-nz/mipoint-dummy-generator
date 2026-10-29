@@ -1,16 +1,17 @@
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{Cursor, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Format {
     Docx,
     Xlsx,
@@ -33,7 +34,7 @@ impl Format {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     pub output: PathBuf,
     pub files: usize,
@@ -796,11 +797,18 @@ fn size_cycle(
     sizes
 }
 
+const INVENTORY_HEADER: &[u8] = b"\xef\xbb\xbfRelativePath,FileName,Extension,SizeBytes,FolderDepth,RecordID,BusinessUnit,Department,Team,BusinessProcess,FinancialYear,RecordCategory,Owner,Status,Classification\r\n";
+// Bump this when changing record generation or RNG consumption so resumes cannot mix versions.
+const CHECKPOINT_VERSION: u32 = 1;
+const HASH_START: u64 = 0xcbf29ce484222325;
+
 #[derive(Clone, Debug)]
 pub struct Progress {
     pub completed: usize,
     pub bytes: u64,
     pub output: PathBuf,
+    pub checkpoint: PathBuf,
+    pub message: String,
 }
 #[derive(Debug)]
 pub struct Report {
@@ -808,71 +816,475 @@ pub struct Report {
     pub bytes: u64,
     pub output: PathBuf,
     pub cancelled: bool,
+    pub paused: bool,
+    pub checkpoint: PathBuf,
+    pub reason: Option<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Job {
+    version: u32,
+    generation: u64,
+    config: Config,
+    output: PathBuf,
+    organisation: String,
+    completed: usize,
+    bytes: u64,
+    rng: u64,
+    size_rng: u64,
+    sizes: Vec<usize>,
+    formats: Vec<Format>,
+    journal_len: u64,
+    journal_hash: u64,
+    retry_seconds: u64,
+    complete: bool,
+}
+#[derive(Serialize, Deserialize)]
+struct Envelope {
+    payload: String,
+    checksum: u64,
 }
 
-fn new_run_folder(parent: &Path, seed: u64) -> Result<PathBuf, String> {
-    fs::create_dir_all(parent).map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
-    for n in 1..=100_000 {
-        let name = if n == 1 {
-            format!("Dataset-{seed}")
-        } else {
-            format!("Dataset-{seed}-{n:03}")
+pub struct ResumeInfo {
+    pub config: Config,
+    pub completed: usize,
+    pub bytes: u64,
+    pub output: PathBuf,
+    pub retry_seconds: u64,
+}
+
+pub fn checkpoint_directory() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("MiPoint Generator")
+        .join("Checkpoints")
+}
+
+fn hash(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+fn save_job(directory: &Path, job: &mut Job) -> Result<(), String> {
+    let generation = job.generation + 1;
+    let previous = job.generation;
+    job.generation = generation;
+    let result = (|| {
+        let payload = serde_json::to_string(job).map_err(|e| e.to_string())?;
+        let envelope = Envelope {
+            checksum: hash(HASH_START, payload.as_bytes()),
+            payload,
         };
-        let path = parent.join(name);
-        match fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("Cannot create {}: {e}", path.display())),
+        let bytes = serde_json::to_vec(&envelope).map_err(|e| e.to_string())?;
+        let slot = directory.join(if generation.is_multiple_of(2) {
+            "checkpoint-a.json"
+        } else {
+            "checkpoint-b.json"
+        });
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(slot)
+            .map_err(|e| e.to_string())?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
+        job.generation = previous;
+    }
+    result.map_err(|e| {
+        format!(
+            "Cannot save local checkpoint in {}: {e}",
+            directory.display()
+        )
+    })
+}
+fn valid_job(directory: &Path, job: &Job) -> Result<(), String> {
+    job.config.validate()?;
+    if job.version != CHECKPOINT_VERSION
+        || job.completed > job.config.files
+        || !job.output.is_absolute()
+        || job.output.parent() != Some(job.config.output.as_path())
+        || !ORGS.contains(&job.organisation.as_str())
+        || job.formats.len() != job.config.formats.len()
+        || job.formats.iter().any(|f| !job.config.formats.contains(f))
+        || job.retry_seconds > 3600
+    {
+        return Err("Unsupported or invalid saved dataset.".into());
+    }
+    let (minimum, _, maximum) = job.config.size_bounds()?;
+    if job.sizes.len() > 15
+        || job.sizes.iter().any(|s| *s < minimum || *s > maximum)
+        || (!job.completed.is_multiple_of(15) && job.sizes.len() < job.completed % 15)
+        || job.bytes < job.completed as u64 * minimum as u64
+        || job.bytes > job.completed as u64 * maximum as u64
+    {
+        return Err("Invalid checkpoint sizes or counters.".into());
+    }
+    if job.config.inventory {
+        let file =
+            fs::File::open(directory.join("inventory-journal.csv")).map_err(|e| e.to_string())?;
+        if file.metadata().map_err(|e| e.to_string())?.len() < job.journal_len {
+            return Err("Incomplete local inventory journal.".into());
+        }
+        let mut reader = file.take(job.journal_len);
+        let mut buffer = [0u8; 65536];
+        let mut digest = HASH_START;
+        loop {
+            let n = reader.read(&mut buffer).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            digest = hash(digest, &buffer[..n]);
+        }
+        if digest != job.journal_hash {
+            return Err("Local inventory journal failed its integrity check.".into());
         }
     }
-    Err("Too many runs with this seed in the output folder.".into())
+    Ok(())
+}
+fn load_job(directory: &Path) -> Result<Job, String> {
+    let mut candidates = Vec::new();
+    for name in ["checkpoint-a.json", "checkpoint-b.json"] {
+        let result: Result<Job, String> = (|| {
+            let bytes = fs::read(directory.join(name)).map_err(|e| e.to_string())?;
+            let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if hash(HASH_START, envelope.payload.as_bytes()) != envelope.checksum {
+                return Err("Checkpoint integrity check failed.".into());
+            }
+            let job: Job = serde_json::from_str(&envelope.payload).map_err(|e| e.to_string())?;
+            valid_job(directory, &job)?;
+            Ok(job)
+        })();
+        if let Ok(job) = result {
+            candidates.push(job);
+        }
+    }
+    candidates.into_iter().max_by_key(|j| j.generation).ok_or_else(|| format!("No valid checkpoint and inventory journal in {}. Select the saved job folder inside {}.",directory.display(),checkpoint_directory().display()))
+}
+pub fn inspect_saved_job(directory: &Path) -> Result<ResumeInfo, String> {
+    let job = load_job(directory)?;
+    Ok(ResumeInfo {
+        config: job.config,
+        completed: job.completed,
+        bytes: job.bytes,
+        output: job.output,
+        retry_seconds: job.retry_seconds,
+    })
+}
+fn job_lock(directory: &Path) -> Result<fs::File, String> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("job.lock"))
+        .map_err(|e| e.to_string())?;
+    file.try_lock()
+        .map_err(|e| format!("This saved dataset is already running, or cannot be locked: {e}"))?;
+    Ok(file)
+}
+
+#[derive(Clone, Copy)]
+struct RetryPolicy {
+    window: Duration,
+    interval: Duration,
+}
+fn transient(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::NotFound
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    ) || matches!(
+        error.raw_os_error(),
+        Some(53 | 54 | 55 | 58 | 59 | 64 | 67 | 121 | 1201 | 1222 | 1231 | 1232 | 1236 | 2250)
+    )
+}
+fn retry_io<T>(
+    mut operation: impl FnMut() -> io::Result<T>,
+    policy: RetryPolicy,
+    cancel: &AtomicBool,
+    mut notify: impl FnMut(String),
+) -> io::Result<T> {
+    let mut failure_started = None;
+    let mut attempts = 0;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let started = *failure_started.get_or_insert_with(Instant::now);
+                if cancel.load(Ordering::Relaxed)
+                    || !transient(&error)
+                    || started.elapsed() >= policy.window
+                {
+                    return Err(error);
+                }
+                attempts += 1;
+                notify(format!(
+                    "Retrying destination (attempt {attempts}, {:.0}/{:.0} seconds): {error}",
+                    started.elapsed().as_secs_f64(),
+                    policy.window.as_secs_f64()
+                ));
+                let wait = policy
+                    .interval
+                    .min(policy.window.saturating_sub(started.elapsed()));
+                let until = Instant::now() + wait;
+                while Instant::now() < until {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(error);
+                    }
+                    std::thread::sleep(
+                        Duration::from_millis(100)
+                            .min(until.saturating_duration_since(Instant::now())),
+                    );
+                }
+                if started.elapsed() >= policy.window {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+fn equal_file(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    let mut file = fs::File::open(path)?;
+    if file.metadata()?.len() != bytes.len() as u64 {
+        return Ok(false);
+    }
+    let mut buffer = [0u8; 65536];
+    let mut at = 0;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(at == bytes.len());
+        }
+        if bytes.get(at..at + n) != Some(&buffer[..n]) {
+            return Ok(false);
+        }
+        at += n;
+    }
+}
+#[cfg(windows)]
+fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(source: *const u16, target: *const u16, flags: u32) -> i32;
+    }
+    // Canonicalise the existing parent to preserve Windows extended-length UNC paths.
+    let parent = source
+        .parent()
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Missing temporary file parent")
+        })?
+        .canonicalize()?;
+    let source = parent.join(source.file_name().unwrap_or_default());
+    let target = parent.join(target.file_name().unwrap_or_default());
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Same-directory replacement publishes only a fully written inventory.
+    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 1 | 8) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+#[cfg(not(windows))]
+fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(source, target)
+}
+fn publish_file(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
+    match equal_file(path, bytes) {
+        Ok(true) => return Ok(()),
+        Ok(false) if !replace => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "Existing file differs from the saved dataset: {}",
+                    path.display()
+                ),
+            ))
+        }
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing output parent"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_file_name(format!(
+        ".{}.mipoint-part",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    if replace {
+        replace_file(&temporary, path)?;
+    } else {
+        fs::rename(&temporary, path)?;
+    }
+    Ok(())
+}
+fn progress(job: &Job, directory: &Path, message: String) -> Progress {
+    Progress {
+        completed: job.completed,
+        bytes: job.bytes,
+        output: job.output.clone(),
+        checkpoint: directory.to_path_buf(),
+        message,
+    }
+}
+fn report(job: &Job, directory: &Path, cancelled: bool, reason: Option<String>) -> Report {
+    Report {
+        completed: job.completed,
+        bytes: job.bytes,
+        output: job.output.clone(),
+        cancelled,
+        paused: !job.complete,
+        checkpoint: directory.to_path_buf(),
+        reason,
+    }
 }
 
 pub fn generate(
     cfg: &Config,
     cancel: &Arc<AtomicBool>,
-    mut on_progress: impl FnMut(Progress),
+    on_progress: impl FnMut(Progress),
+) -> Result<Report, String> {
+    start_job(cfg, cancel, 120, on_progress)
+}
+pub fn start_job(
+    cfg: &Config,
+    cancel: &Arc<AtomicBool>,
+    retry_seconds: u64,
+    on_progress: impl FnMut(Progress),
+) -> Result<Report, String> {
+    create_job(
+        cfg,
+        cancel,
+        retry_seconds,
+        &checkpoint_directory(),
+        on_progress,
+    )
+}
+fn create_job(
+    cfg: &Config,
+    cancel: &AtomicBool,
+    retry_seconds: u64,
+    base: &Path,
+    on_progress: impl FnMut(Progress),
 ) -> Result<Report, String> {
     cfg.validate()?;
-    let root = new_run_folder(&cfg.output, cfg.seed)?;
-    on_progress(Progress {
+    if retry_seconds > 3600 {
+        return Err("Retry window must not exceed 3600 seconds.".into());
+    }
+    let id = format!(
+        "{}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        std::process::id()
+    );
+    let directory = base.join(format!("Dataset-{}-{id}", cfg.seed));
+    fs::create_dir_all(&directory)
+        .map_err(|e| format!("Cannot create local checkpoint folder: {e}"))?;
+    let mut rng = Rng::new(cfg.seed);
+    let organisation = pick(&mut rng, ORGS).to_string();
+    let mut job = Job {
+        version: CHECKPOINT_VERSION,
+        generation: 0,
+        config: cfg.clone(),
+        output: cfg.output.join(format!("Dataset-{}-{id}", cfg.seed)),
+        organisation,
         completed: 0,
         bytes: 0,
-        output: root.clone(),
-    });
-    generate_into(cfg, &root, cancel, &mut on_progress)
-        .map_err(|e| format!("{e}\nPartial dataset: {}", root.display()))
-}
-
-fn generate_into(
-    cfg: &Config,
-    root: &Path,
-    cancel: &AtomicBool,
-    on_progress: &mut impl FnMut(Progress),
-) -> Result<Report, String> {
-    use std::io::BufWriter;
-    let (minimum, average, maximum) = cfg.size_bounds()?;
-    let mut rng = Rng::new(cfg.seed);
-    let mut size_rng = Rng::new(cfg.seed.wrapping_add(0x12345678));
-    let organisation = pick(&mut rng, ORGS);
-    let mut inventory = if cfg.inventory {
-        let file = fs::OpenOptions::new()
+        rng: rng.0,
+        size_rng: Rng::new(cfg.seed.wrapping_add(0x12345678)).0,
+        sizes: vec![],
+        formats: cfg.formats.clone(),
+        journal_len: INVENTORY_HEADER.len() as u64,
+        journal_hash: hash(HASH_START, INVENTORY_HEADER),
+        retry_seconds,
+        complete: false,
+    };
+    if cfg.inventory {
+        let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(root.join("Structure Inventory.csv"))
+            .open(directory.join("inventory-journal.csv"))
             .map_err(|e| e.to_string())?;
-        let mut writer = BufWriter::with_capacity(262144, file);
-        writer.write_all(b"\xef\xbb\xbfRelativePath,FileName,Extension,SizeBytes,FolderDepth,RecordID,BusinessUnit,Department,Team,BusinessProcess,FinancialYear,RecordCategory,Owner,Status,Classification\r\n").map_err(|e| e.to_string())?;
-        Some(writer)
+        file.write_all(INVENTORY_HEADER)
+            .and_then(|_| file.sync_all())
+            .map_err(|e| e.to_string())?;
+    }
+    save_job(&directory, &mut job)?;
+    run_job(&directory, cancel, on_progress, publish_file)
+}
+pub fn resume(
+    directory: &Path,
+    cancel: &Arc<AtomicBool>,
+    on_progress: impl FnMut(Progress),
+) -> Result<Report, String> {
+    run_job(directory, cancel, on_progress, publish_file)
+}
+
+fn run_job(
+    directory: &Path,
+    cancel: &AtomicBool,
+    mut on_progress: impl FnMut(Progress),
+    mut publish: impl FnMut(&Path, &[u8], bool) -> io::Result<()>,
+) -> Result<Report, String> {
+    let _lock = job_lock(directory)?;
+    // Re-read under the lock so two resume requests cannot use stale counters.
+    let mut job = load_job(directory)?;
+    on_progress(progress(&job, directory, "Generating dataset...".into()));
+    if job.complete {
+        return Ok(report(&job, directory, false, None));
+    }
+    let mut journal = if job.config.inventory {
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(directory.join("inventory-journal.csv"))
+            .map_err(|e| e.to_string())?;
+        file.set_len(job.journal_len)
+            .and_then(|_| file.seek(SeekFrom::Start(job.journal_len)))
+            .map_err(|e| e.to_string())?;
+        Some(file)
     } else {
         None
     };
-    let mut directories = HashSet::new();
-    let mut completed = 0;
-    let mut bytes = 0u64;
-    let mut sizes = Vec::new();
-    let mut format_cycle = cfg.formats.clone();
-    for i in 0..cfg.files {
+    let cfg = job.config.clone();
+    let root = job.output.clone();
+    let (minimum, average, maximum) = cfg.size_bounds()?;
+    let policy = RetryPolicy {
+        window: Duration::from_secs(job.retry_seconds),
+        interval: Duration::from_secs(5),
+    };
+    let mut rng = Rng(job.rng);
+    let mut size_rng = Rng(job.size_rng);
+    let organisation = job.organisation.clone();
+    let mut sizes = job.sizes.clone();
+    let mut format_cycle = job.formats.clone();
+    for i in job.completed..cfg.files {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -899,7 +1311,7 @@ fn generate_into(
         let financial_year = format!("FY{}-{:02}", fiscal_start, (fiscal_start + 1) % 100);
         let category = category_for(title);
         let depth = rng.between(cfg.max_depth.min(3), cfg.max_depth);
-        let mut dir = root.join(organisation);
+        let mut dir = root.join(&organisation);
         let segments = [
             profile.division,
             profile.department,
@@ -913,10 +1325,6 @@ fn generate_into(
         }
         for _ in 7..depth {
             dir.push(pick(&mut rng, FOLDER_KINDS));
-        }
-        if directories.insert(dir.clone()) {
-            fs::create_dir_all(&dir)
-                .map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
         }
         let status = pick(&mut rng, FILE_SUFFIXES);
         let classification = pick(
@@ -938,7 +1346,7 @@ fn generate_into(
         ));
         let lines = business_text(
             &mut rng,
-            organisation,
+            &organisation,
             profile,
             RecordText {
                 title,
@@ -956,21 +1364,23 @@ fn generate_into(
             profile.process,
             sizes[i % 15],
         )?;
-        let size = content.len();
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
-        if let Err(e) = file.write_all(&content) {
-            drop(file);
-            // Remove only the incomplete file created by this run.
-            let _ = fs::remove_file(&path);
-            return Err(format!("Cannot write {}: {e}", path.display()));
+        if let Err(error) = retry_io(
+            || publish(&path, &content, false),
+            policy,
+            cancel,
+            |m| on_progress(progress(&job, directory, m)),
+        ) {
+            return Ok(report(
+                &job,
+                directory,
+                cancel.load(Ordering::Relaxed),
+                Some(format!("Destination unavailable; dataset paused: {error}")),
+            ));
         }
-        if let Some(writer) = inventory.as_mut() {
+        let mut next = job.clone();
+        if let Some(writer) = journal.as_mut() {
             let row = csv_row(&[
-                path.strip_prefix(root)
+                path.strip_prefix(&root)
                     .map_err(|e| e.to_string())?
                     .to_string_lossy()
                     .replace('\\', "/"),
@@ -979,7 +1389,7 @@ fn generate_into(
                     .to_string_lossy()
                     .into_owned(),
                 format.extension().into(),
-                size.to_string(),
+                content.len().to_string(),
                 depth.to_string(),
                 record_id,
                 profile.division.into(),
@@ -994,27 +1404,54 @@ fn generate_into(
             ]);
             writer
                 .write_all(row.as_bytes())
-                .map_err(|e| format!("Cannot write inventory: {e}"))?;
+                .and_then(|_| writer.sync_all())
+                .map_err(|e| {
+                    format!(
+                        "Local inventory could not be saved. Resume from {}: {e}",
+                        directory.display()
+                    )
+                })?;
+            next.journal_len += row.len() as u64;
+            next.journal_hash = hash(next.journal_hash, row.as_bytes());
         }
-        completed += 1;
-        bytes += size as u64;
-        on_progress(Progress {
-            completed,
-            bytes,
-            output: root.to_path_buf(),
-        });
+        next.completed += 1;
+        next.bytes += content.len() as u64;
+        next.rng = rng.0;
+        next.size_rng = size_rng.0;
+        next.sizes = sizes.clone();
+        next.formats = format_cycle.clone();
+        save_job(directory, &mut next)?;
+        job = next;
+        on_progress(progress(&job, directory, "Generating dataset...".into()));
     }
-    if let Some(mut writer) = inventory {
-        writer
-            .flush()
-            .map_err(|e| format!("Cannot finish inventory: {e}"))?;
+    if cfg.inventory {
+        let bytes = fs::read(directory.join("inventory-journal.csv")).map_err(|e| e.to_string())?;
+        if let Err(error) = retry_io(
+            || publish(&root.join("Structure Inventory.csv"), &bytes, true),
+            policy,
+            cancel,
+            |m| on_progress(progress(&job, directory, m)),
+        ) {
+            return Ok(report(
+                &job,
+                directory,
+                cancel.load(Ordering::Relaxed),
+                Some(format!(
+                    "Inventory publication is pending; dataset paused: {error}"
+                )),
+            ));
+        }
     }
-    Ok(Report {
-        completed,
-        bytes,
-        output: root.to_path_buf(),
-        cancelled: completed < cfg.files,
-    })
+    if job.completed == cfg.files {
+        job.complete = true;
+        save_job(directory, &mut job)?;
+    }
+    Ok(report(
+        &job,
+        directory,
+        cancel.load(Ordering::Relaxed),
+        None,
+    ))
 }
 
 #[cfg(test)]
@@ -1083,5 +1520,377 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(a.next(), b.next());
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    struct Sandbox(PathBuf);
+    impl Sandbox {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!(
+                "mipoint-recovery-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&p).unwrap();
+            Self(p)
+        }
+        fn config(&self, name: &str) -> Config {
+            Config {
+                output: self.0.join(name),
+                files: 17,
+                max_depth: 7,
+                seed: 4242,
+                formats: vec![
+                    Format::Docx,
+                    Format::Xlsx,
+                    Format::Pptx,
+                    Format::Csv,
+                    Format::Rtf,
+                    Format::Txt,
+                ],
+                inventory: true,
+                average_mb: 0.12,
+                minimum_mb: 0.1,
+                maximum_mb: 0.2,
+            }
+        }
+        fn paused(&self, cfg: &Config) -> Report {
+            create_job(cfg, &AtomicBool::new(true), 0, &self.0.join("jobs"), |_| {}).unwrap()
+        }
+    }
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let path = self.0.canonicalize().unwrap();
+            assert!(path.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+            assert!(self
+                .0
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("mipoint-recovery-"));
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(root: &Path, p: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(p).unwrap() {
+                let p = entry.unwrap().path();
+                if p.is_dir() {
+                    walk(root, &p, files)
+                } else {
+                    files.insert(
+                        p.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(p).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+    fn assert_reference(sandbox: &Sandbox, result: &Report) {
+        let cfg = sandbox.config("reference");
+        let expected = create_job(
+            &cfg,
+            &AtomicBool::new(false),
+            0,
+            &sandbox.0.join("jobs"),
+            |_| {},
+        )
+        .unwrap();
+        assert!(!result.paused);
+        assert_eq!(result.completed, 17);
+        assert_eq!(result.bytes, 17 * 120_000);
+        assert_eq!(files(&result.output), files(&expected.output));
+    }
+    #[test]
+    fn transient_outage_recovers_within_window() {
+        let mut attempts = 0;
+        let mut notices = 0;
+        let result = retry_io(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(io::Error::from(io::ErrorKind::TimedOut))
+                } else {
+                    Ok(42)
+                }
+            },
+            RetryPolicy {
+                window: Duration::from_secs(1),
+                interval: Duration::from_millis(1),
+            },
+            &AtomicBool::new(false),
+            |_| notices += 1,
+        )
+        .unwrap();
+        assert_eq!(result, 42);
+        assert_eq!(attempts, 3);
+        assert_eq!(notices, 2);
+    }
+    #[test]
+    fn persistent_outage_exhausts_retry_window() {
+        let started = Instant::now();
+        let mut attempts = 0;
+        let error = retry_io(
+            || {
+                attempts += 1;
+                Err::<(), _>(io::Error::from(io::ErrorKind::TimedOut))
+            },
+            RetryPolicy {
+                window: Duration::from_millis(20),
+                interval: Duration::from_millis(2),
+            },
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(attempts > 1);
+        assert!(started.elapsed() >= Duration::from_millis(20));
+    }
+    #[test]
+    fn pause_interrupts_retry_wait_and_permanent_errors_do_not_retry() {
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        assert!(retry_io(
+            || Err::<(), _>(io::Error::from(io::ErrorKind::TimedOut)),
+            RetryPolicy {
+                window: Duration::from_secs(120),
+                interval: Duration::from_secs(5)
+            },
+            &cancel,
+            |_| cancel.store(true, Ordering::Relaxed)
+        )
+        .is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let mut attempts = 0;
+        assert!(retry_io(
+            || {
+                attempts += 1;
+                Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+            RetryPolicy {
+                window: Duration::from_secs(120),
+                interval: Duration::from_secs(5)
+            },
+            &AtomicBool::new(false),
+            |_| {}
+        )
+        .is_err());
+        assert_eq!(attempts, 1);
+    }
+    #[test]
+    fn outage_pauses_and_serialised_resume_matches_uninterrupted_run() {
+        let s = Sandbox::new();
+        let paused = s.paused(&s.config("out"));
+        let mut writes = 0;
+        let stopped = run_job(
+            &paused.checkpoint,
+            &AtomicBool::new(false),
+            |_| {},
+            |p, b, replace| {
+                if writes == 3 {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+                publish_file(p, b, replace)?;
+                if !replace {
+                    writes += 1;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(stopped.paused);
+        assert_eq!(stopped.completed, 3);
+        let info = inspect_saved_job(&stopped.checkpoint).unwrap();
+        assert_eq!(info.completed, 3);
+        let resumed = resume(
+            &stopped.checkpoint,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert_reference(&s, &resumed);
+    }
+    #[test]
+    fn lost_write_acknowledgement_does_not_duplicate_a_file_or_inventory_row() {
+        let s = Sandbox::new();
+        let initial = s.paused(&s.config("out"));
+        let paused = run_job(
+            &initial.checkpoint,
+            &AtomicBool::new(false),
+            |_| {},
+            |p, b, replace| {
+                publish_file(p, b, replace)?;
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            },
+        )
+        .unwrap();
+        assert!(paused.paused);
+        assert_eq!(paused.completed, 0);
+        let resumed = resume(
+            &paused.checkpoint,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert_reference(&s, &resumed);
+    }
+    #[test]
+    fn partial_temporary_file_is_replaced_on_resume() {
+        let s = Sandbox::new();
+        let initial = s.paused(&s.config("out"));
+        let paused = run_job(
+            &initial.checkpoint,
+            &AtomicBool::new(false),
+            |_| {},
+            |p, b, _| {
+                fs::create_dir_all(p.parent().unwrap())?;
+                fs::write(
+                    p.with_file_name(format!(
+                        ".{}.mipoint-part",
+                        p.file_name().unwrap().to_string_lossy()
+                    )),
+                    &b[..20],
+                )?;
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            },
+        )
+        .unwrap();
+        let resumed = resume(
+            &paused.checkpoint,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert_reference(&s, &resumed);
+    }
+    #[test]
+    fn pending_inventory_is_published_without_regenerating_completed_files() {
+        let s = Sandbox::new();
+        let initial = s.paused(&s.config("out"));
+        let paused = run_job(
+            &initial.checkpoint,
+            &AtomicBool::new(false),
+            |_| {},
+            |p, b, replace| {
+                if replace {
+                    Err(io::Error::from(io::ErrorKind::TimedOut))
+                } else {
+                    publish_file(p, b, replace)
+                }
+            },
+        )
+        .unwrap();
+        assert!(paused.paused);
+        assert_eq!(paused.completed, 17);
+        let mut content_writes = 0;
+        let resumed = run_job(
+            &paused.checkpoint,
+            &AtomicBool::new(false),
+            |_| {},
+            |p, b, replace| {
+                if !replace {
+                    content_writes += 1;
+                }
+                publish_file(p, b, replace)
+            },
+        )
+        .unwrap();
+        assert_eq!(content_writes, 0);
+        assert_reference(&s, &resumed);
+    }
+    #[test]
+    fn torn_checkpoint_falls_back_and_discards_uncommitted_journal_tail() {
+        let s = Sandbox::new();
+        let initial = s.paused(&s.config("out"));
+        let mut writes = 0;
+        let paused = run_job(
+            &initial.checkpoint,
+            &AtomicBool::new(false),
+            |_| {},
+            |p, b, replace| {
+                if writes == 3 {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut));
+                }
+                publish_file(p, b, replace)?;
+                writes += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        let job = load_job(&paused.checkpoint).unwrap();
+        let name = if job.generation.is_multiple_of(2) {
+            "checkpoint-a.json"
+        } else {
+            "checkpoint-b.json"
+        };
+        fs::write(paused.checkpoint.join(name), b"torn JSON").unwrap();
+        let mut journal = fs::OpenOptions::new()
+            .append(true)
+            .open(paused.checkpoint.join("inventory-journal.csv"))
+            .unwrap();
+        journal.write_all(b"uncommitted tail").unwrap();
+        drop(journal);
+        assert_eq!(load_job(&paused.checkpoint).unwrap().completed, 2);
+        let resumed = resume(
+            &paused.checkpoint,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert_reference(&s, &resumed);
+    }
+    #[test]
+    fn resume_refuses_conflicting_existing_file() {
+        let s = Sandbox::new();
+        let initial = s.paused(&s.config("out"));
+        let mut conflicting = None;
+        let paused = run_job(
+            &initial.checkpoint,
+            &AtomicBool::new(false),
+            |_| {},
+            |p, _, _| {
+                fs::create_dir_all(p.parent().unwrap())?;
+                fs::write(p, b"keep existing data")?;
+                conflicting = Some(p.to_path_buf());
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            },
+        )
+        .unwrap();
+        let resumed = resume(
+            &paused.checkpoint,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert!(resumed.paused);
+        assert_eq!(resumed.completed, 0);
+        assert_eq!(
+            fs::read(conflicting.unwrap()).unwrap(),
+            b"keep existing data"
+        );
+    }
+    #[test]
+    fn concurrent_resume_is_rejected() {
+        let s = Sandbox::new();
+        let initial = s.paused(&s.config("out"));
+        let _lock = job_lock(&initial.checkpoint).unwrap();
+        assert!(resume(
+            &initial.checkpoint,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {}
+        )
+        .unwrap_err()
+        .contains("already running"));
     }
 }

@@ -44,7 +44,7 @@ const HELP: &[(&str, &str)] = &[
  ("How size padding works", "Office files are Open XML ZIP packages with readable business XML plus a declared, uncompressed synthetic binary part. The binary part repeats a seeded 64 KiB block. XML is stored without compression. Text and RTF repeat synthetic notes; CSV uses a quoted supporting-comments field. Spaces complete the final bytes. These are valid synthetic fixtures, not a model of real document entropy, deduplication or compression ratios."),
  ("Seed and repeatability", "Leave the seed blank for a time-derived value, or enter an unsigned 64-bit integer, including zero. The actual seed appears in the settings and status. The same seed AND settings in this version reproduce relative paths, file bytes, sizes and inventory. Run folder suffixes may differ. Filesystem creation/modification timestamps depend on the real run time and are not reproducible. Different app versions need not reproduce earlier output."),
  ("Inventory and metadata", "The optional Structure Inventory.csv is enabled by default. It records each completed content file: relative path, name, extension, exact size and folder depth, plus ten synthetic fields: record ID, business unit, department, team, business process, financial year, record category, owner, status and classification. Metadata is in the CSV, not applied as filesystem attributes or Office custom properties. Paths are relative to the run folder. The inventory uses UTF-8 with BOM for Excel and is additional to the file count and estimated content size."),
- ("Progress, stopping and errors", "Generation runs in a background worker. Status shows completed files, written MB, elapsed time, MB/s and estimated remaining time based on bytes. The estimate improves as work proceeds and depends on storage speed. Stop finishes the current file and retains completed files with a matching inventory. A failed run keeps its partial dataset and reports the path. Choose a new run after checking disk space and permissions. Peak content memory is roughly one maximum-sized file plus small buffers."),
+ ("Progress, stopping and errors", "Generation runs in a background worker. Status shows completed files, written MB, elapsed time, MB/s and estimated remaining time based on bytes. The estimate improves as work proceeds and depends on storage speed. Pause finishes the current file, or stops retry waiting, and saves the job locally. Transient destination errors are retried every 5 seconds for the configured window (default 120 seconds), then the dataset pauses. Use Resume paused dataset, or Open saved dataset after restarting the app. Checkpoints and the inventory journal are under %LOCALAPPDATA%\\MiPoint Generator\\Checkpoints. The network inventory is published on normal pause or completion when reachable. Windows calls may also wait for OS network timeouts. Existing datasets from version 0.2.0 have no resumable checkpoint. A failed run keeps its partial dataset and reports the path. Choose a new run after checking disk space and permissions. Peak content memory is roughly one maximum-sized file plus small buffers."),
  ("Portable application", "Launch mipoint-dummy-generator.exe by double-clicking it. No command prompt, Office installation, Rust or Python is required to generate data. The portable build targets Windows 11 x64 and statically links the MSVC C runtime. Windows system libraries and a working OpenGL 2.0 graphics driver are required. Output remains local; the application does not upload generated data."),
 ];
 
@@ -75,6 +75,9 @@ struct GeneratorApp {
     bytes: u64,
     run_folder: Option<PathBuf>,
     message: String,
+    retry_seconds: u64,
+    resume_job: Option<PathBuf>,
+    session_start_bytes: u64,
 }
 impl Default for GeneratorApp {
     fn default() -> Self {
@@ -108,6 +111,9 @@ impl Default for GeneratorApp {
             bytes: 0,
             run_folder: None,
             message: "Ready to create your synthetic dataset.".into(),
+            retry_seconds: 120,
+            resume_job: None,
+            session_start_bytes: 0,
         }
     }
 }
@@ -169,7 +175,32 @@ impl GeneratorApp {
         cfg.validate()?;
         Ok(cfg)
     }
-    fn start(&mut self, ctx: &egui::Context) {
+    fn restore(&mut self, directory: PathBuf, ctx: &egui::Context) {
+        match engine::inspect_saved_job(&directory) {
+            Ok(info) => {
+                self.output = info.config.output.display().to_string();
+                self.files = info.config.files;
+                self.depth = info.config.max_depth;
+                self.seed = info.config.seed.to_string();
+                self.formats = FORMATS.map(|f| info.config.formats.contains(&f));
+                self.preset = 4;
+                self.average = info.config.average_mb;
+                self.minimum = info.config.minimum_mb;
+                self.maximum = info.config.maximum_mb;
+                self.inventory = info.config.inventory;
+                self.retry_seconds = info.retry_seconds;
+                self.completed = info.completed;
+                self.bytes = info.bytes;
+                self.session_start_bytes = info.bytes;
+                self.total_files = self.files;
+                self.run_folder = Some(info.output);
+                self.resume_job = Some(directory);
+                self.start(ctx, true);
+            }
+            Err(e) => self.message = e,
+        }
+    }
+    fn start(&mut self, ctx: &egui::Context, resuming: bool) {
         if self.seed.trim().is_empty() {
             self.seed = (SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -188,10 +219,20 @@ impl GeneratorApp {
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
         let ctx = ctx.clone();
-        self.completed = 0;
+        if !resuming {
+            self.completed = 0;
+            self.bytes = 0;
+            self.session_start_bytes = 0;
+            self.run_folder = None;
+            self.resume_job = None;
+        }
         self.total_files = cfg.files;
-        self.bytes = 0;
-        self.run_folder = None;
+        let saved_job = if resuming {
+            self.resume_job.clone()
+        } else {
+            None
+        };
+        let retry_seconds = self.retry_seconds;
         self.started = Some(Instant::now());
         self.duration = Duration::ZERO;
         self.message = format!("Generating with seed {}", cfg.seed);
@@ -199,13 +240,21 @@ impl GeneratorApp {
         std::thread::spawn(move || {
             let mut last = Instant::now();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                engine::generate(&cfg, &cancel, |p| {
-                    if p.completed == 0 || last.elapsed() >= Duration::from_millis(100) {
+                let on_progress = |p: Progress| {
+                    if p.completed == 0
+                        || p.message.starts_with("Retrying")
+                        || last.elapsed() >= Duration::from_millis(100)
+                    {
                         let _ = tx.send(Message::Progress(p));
                         ctx.request_repaint();
                         last = Instant::now();
                     }
-                })
+                };
+                if let Some(directory) = saved_job {
+                    engine::resume(&directory, &cancel, on_progress)
+                } else {
+                    engine::start_job(&cfg, &cancel, retry_seconds, on_progress)
+                }
             }));
             let message = match result { Ok(Ok(r)) => Message::Done(r), Ok(Err(e)) => Message::Failed(e), Err(_) => Message::Failed("The worker stopped unexpectedly. Check the output folder for a partial dataset.".into()) };
             let _ = tx.send(message);
@@ -224,17 +273,20 @@ impl GeneratorApp {
                     self.completed = p.completed;
                     self.bytes = p.bytes;
                     self.run_folder = Some(p.output);
+                    self.resume_job = Some(p.checkpoint);
+                    self.message = p.message;
                 }
                 Message::Done(r) => {
                     self.completed = r.completed;
                     self.bytes = r.bytes;
                     self.run_folder = Some(r.output);
+                    self.resume_job = if r.paused { Some(r.checkpoint) } else { None };
                     self.duration = self.started.map(|t| t.elapsed()).unwrap_or_default();
                     self.receiver = None;
                     self.message = format!(
                         "{} {} files, {:.2} MB total, {:.6} MB average. Seed {}.",
-                        if r.cancelled {
-                            "Stopped after"
+                        if r.paused {
+                            "Paused after"
                         } else {
                             "Completed:"
                         },
@@ -243,6 +295,14 @@ impl GeneratorApp {
                         r.bytes as f64 / r.completed.max(1) as f64 / 1e6,
                         self.seed
                     );
+                    if let Some(reason) = r.reason {
+                        self.message.push_str(&format!(" {reason}"));
+                    }
+                    if r.paused {
+                        self.message.push_str(
+                            " Use Resume paused dataset when the destination is available.",
+                        );
+                    }
                 }
                 Message::Failed(e) => {
                     self.duration = self.started.map(|t| t.elapsed()).unwrap_or_default();
@@ -297,6 +357,19 @@ impl GeneratorApp {
                     .hint_text("Leave blank for a new seed"),
             );
             note(ui, "Reuse the seed and settings to reproduce a dataset. Depth includes the organisation folder.");
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Network retry window (seconds)");
+                ui.add(
+                    egui::DragValue::new(&mut self.retry_seconds)
+                        .range(5..=3600)
+                        .speed(5),
+                );
+            });
+            note(
+                ui,
+                "Retry every 5 seconds, then pause. Resume uses a checkpoint saved on this PC.",
+            );
             ui.add_space(10.0);
             ui.checkbox(&mut self.inventory, "Create companion inventory CSV");
             note(
@@ -398,7 +471,7 @@ impl GeneratorApp {
         };
         let secs = elapsed.as_secs_f64();
         let rate = if secs > 0.0 {
-            self.bytes as f64 / 1e6 / secs
+            self.bytes.saturating_sub(self.session_start_bytes) as f64 / 1e6 / secs
         } else {
             0.0
         };
@@ -422,18 +495,41 @@ impl GeneratorApp {
                     )
                     .clicked()
                 {
-                    self.start(ui.ctx());
+                    self.start(ui.ctx(), false);
                 }
                 if working
                     && ui
                         .add_enabled(
                             !self.cancel.load(Ordering::Relaxed),
-                            egui::Button::new("Stop after current file"),
+                            egui::Button::new("Pause dataset"),
                         )
                         .clicked()
                 {
                     self.cancel.store(true, Ordering::Relaxed);
-                    self.message = "Stopping after the current file...".into();
+                    self.message = "Pausing after the current file or retry wait...".into();
+                }
+                if ui
+                    .add_enabled(
+                        !working && self.resume_job.is_some(),
+                        egui::Button::new("Resume paused dataset"),
+                    )
+                    .clicked()
+                {
+                    if let Some(directory) = self.resume_job.clone() {
+                        self.restore(directory, ui.ctx());
+                    }
+                }
+                if ui
+                    .add_enabled(!working, egui::Button::new("Open saved dataset..."))
+                    .clicked()
+                {
+                    if let Some(directory) = rfd::FileDialog::new()
+                        .set_title("Select a saved job folder")
+                        .set_directory(engine::checkpoint_directory())
+                        .pick_folder()
+                    {
+                        self.restore(directory, ui.ctx());
+                    }
                 }
                 if let Some(path) = &self.run_folder {
                     if ui.button("Open output folder").clicked() {
@@ -477,6 +573,11 @@ impl GeneratorApp {
             }
             if let Some(path) = &self.run_folder {
                 note(ui, format!("Dataset: {}", path.display()));
+            }
+            if !working {
+                if let Some(directory) = &self.resume_job {
+                    note(ui, format!("Saved job on this PC: {}", directory.display()));
+                }
             }
         });
     }
@@ -529,6 +630,7 @@ impl GeneratorApp {
                 note(ui,"Realistic business structures. Repeatable migration tests. Entirely synthetic data.");
                 ui.add_space(18.0);
                 let working = self.working();
+                egui::CollapsingHeader::new("Configuration").id_salt("configuration").default_open(true).show(ui, |ui| {
                 ui.add_enabled_ui(!working, |ui| {
                     self.output_card(ui);
                     ui.add_space(12.0);
@@ -550,6 +652,7 @@ impl GeneratorApp {
                         ui.add_space(12.0);
                         self.sizes_card(ui);
                     }
+                });
                 });
                 ui.add_space(12.0);
             });
@@ -621,9 +724,17 @@ mod tests {
     fn draw_at(app: &mut GeneratorApp, width: f32, events: Vec<egui::Event>) -> egui::FullOutput {
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::light());
+        draw_on(&ctx, app, width, events)
+    }
+    fn draw_on(
+        ctx: &egui::Context,
+        app: &mut GeneratorApp,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 640.0));
         let mut output = None;
-        for frame in 0..3 {
+        for frame in 0..16 {
             let input = egui::RawInput {
                 screen_rect: Some(rect),
                 events: if frame == 2 { events.clone() } else { vec![] },
@@ -656,6 +767,76 @@ mod tests {
                 .expect("Generate button must be rendered");
             assert!(button.pos.y >= 0.0 && button.pos.y + button.galley.size().y <= 640.0);
         }
+    }
+    #[test]
+    fn configuration_collapses_while_generation_controls_stay_visible() {
+        let ctx = egui::Context::default();
+        ctx.set_visuals(egui::Visuals::light());
+        let mut app = GeneratorApp::default();
+        let expanded = draw_on(&ctx, &mut app, 1040.0, vec![]);
+        let text_position = expanded
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Configuration" => {
+                    Some(t.pos + egui::vec2(5.0, 5.0))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let collapsed = draw_on(
+            &ctx,
+            &mut app,
+            1040.0,
+            vec![
+                egui::Event::PointerMoved(text_position),
+                egui::Event::PointerButton {
+                    pos: text_position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: text_position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let texts = collapsed
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) => Some(t.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(texts.contains(&"Generate dataset"));
+        assert!(!texts.contains(&"01  Output location"));
+        let reopened = draw_on(
+            &ctx,
+            &mut app,
+            1040.0,
+            vec![
+                egui::Event::PointerMoved(text_position),
+                egui::Event::PointerButton {
+                    pos: text_position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: text_position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert!(reopened.shapes.iter().any(
+            |s| matches!(&s.shape,egui::Shape::Text(t) if t.galley.job.text=="01  Output location")
+        ));
     }
     #[test]
     fn f1_opens_help() {

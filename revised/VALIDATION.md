@@ -1,4 +1,18 @@
-# Verification record
+# Version 0.3.0 verification
+
+Verified on 30 October 2026 on the same Windows 11 x64 workstation with Rust 1.99.1.
+
+- Release tests: 22 passed, 0 failed. The two large disk-writing benchmarks remain ignored by default.
+- Release Clippy with `--all-targets -- -D warnings` and `cargo fmt --check` passed.
+- Ten new fault-injection tests cover transient recovery, retry exhaustion, interruptible waiting, non-transient errors, serialised pause/resume, lost write acknowledgements, partial temporary files, pending inventory publication, corrupt checkpoint fallback, uncommitted journal tails, conflicting existing files and exclusive job locking.
+- Resumed sample datasets were compared byte for byte, including inventory, against uninterrupted runs across a partial 15-file size cycle.
+- GUI checks exercise collapse and reopen of Configuration while Generate remains rendered, plus the existing width, validation and F1 checks.
+- A new 60-file sample again passed the Python structure/format checks and Microsoft Open XML SDK validation for all 30 Office packages.
+- One current 288,000,000-byte local sample completed in 1.713167 seconds (168.110 MB/s). This is a single non-comparative observation, not a new speed improvement claim. Per-file destination flushes and durable local checkpoints add I/O; network throughput depends on SMB/server latency. The older three-run figures below describe version 0.2.0 only.
+
+Outages were simulated through injected destination I/O errors. Actual network disconnection/reconnection, a machine reboot during generation, SMB server failover and remote filesystem durability were not exercised. Windows may block inside an OS file call before the retry logic receives an error. The retry window therefore does not impose a hard timeout on outstanding OS calls. Resume checks the pending file but does not audit previously completed files for later external changes.
+
+# Version 0.2.0 verification record (historical)
 
 Verified on 29 October 2026 on this Windows 11 x64 workstation, using Rust 1.99.1 and Cargo 1.99.1. The application targets Rust 1.95 or newer.
 

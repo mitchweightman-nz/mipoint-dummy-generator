@@ -1,6 +1,6 @@
 [package]
 name = "mipoint-dummy-generator"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.95"
 description = "Generate synthetic business folder structures and Office documents for migration testing"
@@ -14,3 +14,6 @@ path = "src/main.rs"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "accesskit", "clipboard"] }
 rfd = "0.17"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

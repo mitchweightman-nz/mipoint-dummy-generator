@@ -70,6 +70,17 @@ fn cleanup(p: &std::path::Path) {
         .starts_with("mipoint-test-"));
     std::fs::remove_dir_all(p).unwrap();
 }
+fn cleanup_checkpoint(directory: &std::path::Path) {
+    let resolved = directory.canonicalize().unwrap();
+    let base = engine::checkpoint_directory().canonicalize().unwrap();
+    assert_eq!(resolved.parent(), Some(base.as_path()));
+    assert!(resolved
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("Dataset-4242-"));
+    std::fs::remove_dir_all(resolved).unwrap();
+}
 #[test]
 fn reproducible_inventory_depth_and_no_overwrite() {
     let p = temp("repeat");
@@ -100,6 +111,8 @@ fn reproducible_inventory_depth_and_no_overwrite() {
         18
     );
     assert_eq!(first, contents(&a.output));
+    cleanup_checkpoint(&a.checkpoint);
+    cleanup_checkpoint(&b.checkpoint);
     cleanup(&p);
 }
 #[test]
@@ -123,6 +136,7 @@ fn cancellation_keeps_only_completed_files_and_inventory() {
             .count(),
         4
     );
+    cleanup_checkpoint(&report.checkpoint);
     cleanup(&p);
 }
 #[test]
@@ -157,6 +171,7 @@ fn depth_one_and_inventory_off() {
     assert_eq!(files.len(), 1);
     assert_eq!(files.keys().next().unwrap().components().count(), 2);
     assert_eq!(report.bytes, 120_000);
+    cleanup_checkpoint(&report.checkpoint);
     cleanup(&p);
 }
 #[test]
@@ -164,7 +179,9 @@ fn blocked_destination_reports_error() {
     let p = temp("blocked");
     std::fs::write(&p, b"keep this file").unwrap();
     let cfg = config(p.clone());
-    assert!(engine::generate(&cfg, &Arc::new(AtomicBool::new(false)), |_| {}).is_err());
+    let report = engine::generate(&cfg, &Arc::new(AtomicBool::new(false)), |_| {}).unwrap();
+    assert!(report.paused);
+    cleanup_checkpoint(&report.checkpoint);
     assert_eq!(std::fs::read(&p).unwrap(), b"keep this file");
     std::fs::remove_file(&p).unwrap();
 }
