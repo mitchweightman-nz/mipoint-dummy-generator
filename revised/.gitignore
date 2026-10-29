@@ -1,0 +1,10 @@
+/target/
+/dist/
+/.validation/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+**/bin/
+**/obj/
+__pycache__/

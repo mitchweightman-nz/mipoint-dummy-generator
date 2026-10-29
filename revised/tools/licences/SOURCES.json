@@ -1,0 +1,59 @@
+{
+  "accesskit-0.25.2": [
+    "https://raw.githubusercontent.com/AccessKit/accesskit/f3026222559c7f5f46d8f25cb7404de68eb149f0/LICENSE-MIT",
+    "https://raw.githubusercontent.com/AccessKit/accesskit/f3026222559c7f5f46d8f25cb7404de68eb149f0/LICENSE-APACHE"
+  ],
+  "accesskit_consumer-0.39.2": [
+    "https://raw.githubusercontent.com/AccessKit/accesskit/f3026222559c7f5f46d8f25cb7404de68eb149f0/LICENSE-MIT",
+    "https://raw.githubusercontent.com/AccessKit/accesskit/f3026222559c7f5f46d8f25cb7404de68eb149f0/LICENSE-APACHE"
+  ],
+  "accesskit_windows-0.35.2": [
+    "https://raw.githubusercontent.com/AccessKit/accesskit/f3026222559c7f5f46d8f25cb7404de68eb149f0/LICENSE-MIT",
+    "https://raw.githubusercontent.com/AccessKit/accesskit/f3026222559c7f5f46d8f25cb7404de68eb149f0/LICENSE-APACHE"
+  ],
+  "accesskit_winit-0.34.2": [
+    "https://raw.githubusercontent.com/AccessKit/accesskit/f3026222559c7f5f46d8f25cb7404de68eb149f0/LICENSE-MIT",
+    "https://raw.githubusercontent.com/AccessKit/accesskit/f3026222559c7f5f46d8f25cb7404de68eb149f0/LICENSE-APACHE"
+  ],
+  "clipboard-win-5.4.3": [
+    "https://raw.githubusercontent.com/DoumanAsh/clipboard-win/ed27008ae5d1f10cfbb266de039f0fb35fd05a56/LICENSE"
+  ],
+  "ecolor-0.37.0": [
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-MIT",
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-APACHE"
+  ],
+  "eframe-0.37.0": [
+    "https://raw.githubusercontent.com/emilk/egui/3c6eb8261c3293ad9c7ea1ed58487e038860ebef/LICENSE-MIT",
+    "https://raw.githubusercontent.com/emilk/egui/3c6eb8261c3293ad9c7ea1ed58487e038860ebef/LICENSE-APACHE"
+  ],
+  "egui-0.37.0": [
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-MIT",
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-APACHE"
+  ],
+  "egui-winit-0.37.0": [
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-MIT",
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-APACHE"
+  ],
+  "egui_glow-0.37.0": [
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-MIT",
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-APACHE"
+  ],
+  "emath-0.37.0": [
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-MIT",
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-APACHE"
+  ],
+  "epaint-0.37.0": [
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-MIT",
+    "https://raw.githubusercontent.com/emilk/egui/fc9d66dda742d722eedaa8684d23f86369cf8e5f/LICENSE-APACHE"
+  ],
+  "gl_generator-0.14.0": [
+    "https://raw.githubusercontent.com/brendanzab/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/LICENSE"
+  ],
+  "khronos_api-3.1.0": [
+    "https://raw.githubusercontent.com/brendanzab/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/LICENSE"
+  ],
+  "profiling-1.0.18": [
+    "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT",
+    "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE"
+  ]
+}

@@ -1,0 +1,41 @@
+
+running 1 test
+BASELINE files=60 bytes=288001646 seconds=5.638862 MB/s=51.074
+test support::baseline_throughput ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.66s
+
+
+running 1 test
+REVISED files=60 bytes=288000000 seconds=3.873128 MB/s=74.358 output=C:\Devco\MiPoint Dummy Migration Set Generator\revised\.validation\bench-revised-1\Dataset-4242
+test revised_throughput ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 3.89s
+
+
+running 1 test
+BASELINE files=60 bytes=288001646 seconds=5.221959 MB/s=55.152
+test support::baseline_throughput ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.23s
+
+
+running 1 test
+REVISED files=60 bytes=288000000 seconds=1.991019 MB/s=144.650 output=C:\Devco\MiPoint Dummy Migration Set Generator\revised\.validation\bench-revised-2\Dataset-4242
+test revised_throughput ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 2.01s
+
+
+running 1 test
+BASELINE files=60 bytes=288001646 seconds=3.806233 MB/s=75.666
+test support::baseline_throughput ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.92s
+
+
+running 1 test
+REVISED files=60 bytes=288000000 seconds=2.483883 MB/s=115.947 output=C:\Devco\MiPoint Dummy Migration Set Generator\revised\.validation\bench-revised-3\Dataset-4242
+test revised_throughput ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 2.49s
