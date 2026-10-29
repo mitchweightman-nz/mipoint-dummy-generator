@@ -91,19 +91,25 @@ impl Config {
     }
 }
 
-struct Rng(u64);
+struct Rng {
+    state: u64,
+    legacy_names: bool,
+}
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self(seed ^ 0x9e3779b97f4a7c15)
+        Self {
+            state: seed ^ 0x9e3779b97f4a7c15,
+            legacy_names: false,
+        }
     }
     fn next(&mut self) -> u64 {
-        if self.0 == 0 {
-            self.0 = 0xa0761d6478bd642f;
+        if self.state == 0 {
+            self.state = 0xa0761d6478bd642f;
         }
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        self.state
     }
     fn range(&mut self, n: usize) -> usize {
         if n == 0 {
@@ -140,10 +146,135 @@ const ORGS: &[&str] = &[
     "Kauri Advisory",
 ];
 const FIRST: &[&str] = &[
+    // Māori
+    "Manu",
+    "Aroha",
+    "Wiremu",
+    "Moana",
+    "Tane",
+    "Hine",
+    "Rawiri",
+    "Mere",
+    // Pasifika
+    "Sione",
+    "Losa",
+    "Mele",
+    "Tavita",
+    "Faalogo",
+    "Ana",
+    "Peni",
+    // Indian
+    "Navin",
+    "Jaspreet",
+    "Priya",
+    "Arjun",
+    "Rohit",
+    "Anika",
+    "Kiran",
+    "Deepa",
+    // Chinese
+    "Yuki",
+    "Wei",
+    "Jun",
+    "Li",
+    "Mei",
+    "Jia",
+    "Xinyi",
+    // Korean
+    "Minjun",
+    "Jisoo",
+    "Hyun",
+    "Seoyeon",
+    // Filipino
+    "Jose",
+    "Maria",
+    "Carlo",
+    "Angelica",
+    // Anglo / general NZ
+    "Alex",
+    "Morgan",
+    "Jamie",
+    "Taylor",
+    "Sam",
+    "Jordan",
+    "Casey",
+    "Anne",
+    "Avery",
+    "Mat",
+    "Robin",
+    "Cameron",
+    "Charlotte",
+    "Olivia",
+    "Liam",
+    "Noah",
+    "Jack",
+    "Ella",
+    "Amelia",
+    "Sophie",
+    "George",
+];
+// Preserve v0.3.0 name selection when resuming its saved datasets.
+const LEGACY_FIRST: &[&str] = &[
     "Alex", "Morgan", "Jamie", "Taylor", "Sam", "Jordan", "Casey", "Riley", "Avery", "Drew",
     "Robin", "Cameron",
 ];
 const LAST: &[&str] = &[
+    // Māori
+    "Ngata",
+    "Te Aho",
+    "Rangihuna",
+    "Kingi",
+    "Tahana",
+    "Wikiriwhi",
+    // Pasifika
+    "Tupou",
+    "Vaai",
+    "Tuiloma",
+    "Samu",
+    "Fifita",
+    "Latu",
+    // Indian
+    "Patel",
+    "Singh",
+    "Kaur",
+    "Kumar",
+    "Sharma",
+    "Chand",
+    // Chinese
+    "Chen",
+    "Wong",
+    "Zhang",
+    "Liu",
+    "Lin",
+    "Huang",
+    // Korean
+    "Kim",
+    "Lee",
+    "Park",
+    "Choi",
+    // Filipino
+    "Santos",
+    "Reyes",
+    "Garcia",
+    "Cruz",
+    // Anglo / general NZ
+    "Smith",
+    "Jones",
+    "Brown",
+    "Wilson",
+    "Taylor",
+    "Martin",
+    "Thompson",
+    "Wright",
+    "Mason",
+    "Reed",
+    "Walker",
+    "McKenzie",
+    "Anderson",
+    "Campbell",
+    "Young",
+];
+const LEGACY_LAST: &[&str] = &[
     "Mason", "Wright", "Patel", "Chen", "Thompson", "Wilson", "Ngata", "Brown", "Singh", "Martin",
     "Taylor", "Reed",
 ];
@@ -290,7 +421,12 @@ fn pick<'a>(rng: &mut Rng, values: &'a [&'a str]) -> &'a str {
     values[rng.range(values.len())]
 }
 fn person(rng: &mut Rng) -> String {
-    format!("{} {}", pick(rng, FIRST), pick(rng, LAST))
+    let (first, last) = if rng.legacy_names {
+        (LEGACY_FIRST, LEGACY_LAST)
+    } else {
+        (FIRST, LAST)
+    };
+    format!("{} {}", pick(rng, first), pick(rng, last))
 }
 struct RecordText<'a> {
     title: &'a str,
@@ -799,7 +935,7 @@ fn size_cycle(
 
 const INVENTORY_HEADER: &[u8] = b"\xef\xbb\xbfRelativePath,FileName,Extension,SizeBytes,FolderDepth,RecordID,BusinessUnit,Department,Team,BusinessProcess,FinancialYear,RecordCategory,Owner,Status,Classification\r\n";
 // Bump this when changing record generation or RNG consumption so resumes cannot mix versions.
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 2;
 const HASH_START: u64 = 0xcbf29ce484222325;
 
 #[derive(Clone, Debug)]
@@ -904,7 +1040,7 @@ fn save_job(directory: &Path, job: &mut Job) -> Result<(), String> {
 }
 fn valid_job(directory: &Path, job: &Job) -> Result<(), String> {
     job.config.validate()?;
-    if job.version != CHECKPOINT_VERSION
+    if !matches!(job.version, 1 | CHECKPOINT_VERSION)
         || job.completed > job.config.files
         || !job.output.is_absolute()
         || job.output.parent() != Some(job.config.output.as_path())
@@ -1216,8 +1352,8 @@ fn create_job(
         organisation,
         completed: 0,
         bytes: 0,
-        rng: rng.0,
-        size_rng: Rng::new(cfg.seed.wrapping_add(0x12345678)).0,
+        rng: rng.state,
+        size_rng: Rng::new(cfg.seed.wrapping_add(0x12345678)).state,
         sizes: vec![],
         formats: cfg.formats.clone(),
         journal_len: INVENTORY_HEADER.len() as u64,
@@ -1279,8 +1415,14 @@ fn run_job(
         window: Duration::from_secs(job.retry_seconds),
         interval: Duration::from_secs(5),
     };
-    let mut rng = Rng(job.rng);
-    let mut size_rng = Rng(job.size_rng);
+    let mut rng = Rng {
+        state: job.rng,
+        legacy_names: job.version == 1,
+    };
+    let mut size_rng = Rng {
+        state: job.size_rng,
+        legacy_names: false,
+    };
     let organisation = job.organisation.clone();
     let mut sizes = job.sizes.clone();
     let mut format_cycle = job.formats.clone();
@@ -1416,8 +1558,8 @@ fn run_job(
         }
         next.completed += 1;
         next.bytes += content.len() as u64;
-        next.rng = rng.0;
-        next.size_rng = size_rng.0;
+        next.rng = rng.state;
+        next.size_rng = size_rng.state;
         next.sizes = sizes.clone();
         next.formats = format_cycle.clone();
         save_job(directory, &mut next)?;
@@ -1892,5 +2034,75 @@ mod recovery_tests {
         )
         .unwrap_err()
         .contains("already running"));
+    }
+}
+#[cfg(test)]
+mod name_compatibility_tests {
+    use super::*;
+    #[test]
+    fn original_checkpoint_keeps_original_name_pool_after_resume() {
+        let base = std::env::temp_dir().join(format!(
+            "mipoint-name-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = Config {
+            output: base.join("output"),
+            files: 3,
+            max_depth: 1,
+            seed: 42,
+            formats: vec![Format::Txt],
+            inventory: true,
+            average_mb: 0.1,
+            minimum_mb: 0.1,
+            maximum_mb: 0.1,
+        };
+        let paused =
+            create_job(&cfg, &AtomicBool::new(true), 0, &base.join("jobs"), |_| {}).unwrap();
+        let mut job = load_job(&paused.checkpoint).unwrap();
+        job.version = 1;
+        save_job(&paused.checkpoint, &mut job).unwrap();
+        let complete = resume(
+            &paused.checkpoint,
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .unwrap();
+        assert!(!complete.paused);
+        let mut old_rng = Rng {
+            state: Rng::new(42).state,
+            legacy_names: true,
+        };
+        for _ in 0..100 {
+            let name = person(&mut old_rng);
+            let (first, last) = name.split_once(' ').unwrap();
+            assert!(LEGACY_FIRST.contains(&first));
+            assert!(LEGACY_LAST.contains(&last));
+        }
+        let inventory =
+            fs::read_to_string(complete.output.join("Structure Inventory.csv")).unwrap();
+        for line in inventory.lines().skip(1) {
+            let owner = line
+                .split(',')
+                .nth(12)
+                .unwrap()
+                .trim_matches('"')
+                .strip_prefix("Synthetic ")
+                .unwrap();
+            let (first, last) = owner.split_once(' ').unwrap();
+            assert!(LEGACY_FIRST.contains(&first));
+            assert!(LEGACY_LAST.contains(&last));
+        }
+        let resolved = base.canonicalize().unwrap();
+        assert!(resolved.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        assert!(resolved
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("mipoint-name-test-"));
+        fs::remove_dir_all(resolved).unwrap();
     }
 }

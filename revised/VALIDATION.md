@@ -1,3 +1,7 @@
+# Version 0.3.1 rebuild
+
+Rebuilt on 30 October 2026 with the user-edited FIRST and LAST constants copied exactly from the original source into the revised generator. New datasets use these name pools. Existing v0.3.0 checkpoints retain the original pools so resumed content remains consistent. Release tests: 23 passed, including the legacy checkpoint name compatibility check. Formatting and release Clippy passed.
+
 # Version 0.3.0 verification
 
 Verified on 30 October 2026 on the same Windows 11 x64 workstation with Rust 1.99.1.

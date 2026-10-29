@@ -34,8 +34,55 @@ impl Rng {
 
 const FOLDER_KINDS: &[&str] = &["Working Documents", "Approvals", "Meeting Papers", "Reference Material", "Drafts", "Final Deliverables", "Correspondence", "Reports", "Supporting Evidence", "Archive Copy"];
 const ORGS: &[&str] = &["Northstar Services", "Harbour Group", "Summit Operations", "Cedar Consulting", "Bluewater Partners", "Westfield Support", "Meridian Works", "Kauri Advisory"];
-const FIRST: &[&str] = &["Alex", "Morgan", "Jamie", "Taylor", "Sam", "Jordan", "Casey", "Riley", "Avery", "Drew", "Robin", "Cameron"];
-const LAST: &[&str] = &["Mason", "Wright", "Patel", "Chen", "Thompson", "Wilson", "Ngata", "Brown", "Singh", "Martin", "Taylor", "Reed"];
+const FIRST: &[&str] = &[
+    // Māori
+    "Manu", "Aroha", "Wiremu", "Moana", "Tane", "Hine", "Rawiri", "Mere",
+
+    // Pasifika
+    "Sione", "Losa", "Mele", "Tavita", "Faalogo", "Ana", "Peni",
+
+    // Indian
+    "Navin", "Jaspreet", "Priya", "Arjun", "Rohit", "Anika", "Kiran", "Deepa",
+
+    // Chinese
+    "Yuki", "Wei", "Jun", "Li", "Mei", "Jia", "Xinyi",
+
+    // Korean
+    "Minjun", "Jisoo", "Hyun", "Seoyeon",
+
+    // Filipino
+    "Jose", "Maria", "Carlo", "Angelica",
+
+    // Anglo / general NZ
+    "Alex", "Morgan", "Jamie", "Taylor", "Sam", "Jordan", "Casey",
+    "Anne", "Avery", "Mat", "Robin", "Cameron", "Charlotte", "Olivia",
+    "Liam", "Noah", "Jack", "Ella", "Amelia", "Sophie", "George",
+];
+
+const LAST: &[&str] = &[
+    // Māori
+    "Ngata", "Te Aho", "Rangihuna", "Kingi", "Tahana", "Wikiriwhi",
+
+    // Pasifika
+    "Tupou", "Vaai", "Tuiloma", "Samu", "Fifita", "Latu",
+
+    // Indian
+    "Patel", "Singh", "Kaur", "Kumar", "Sharma", "Chand",
+
+    // Chinese
+    "Chen", "Wong", "Zhang", "Liu", "Lin", "Huang",
+
+    // Korean
+    "Kim", "Lee", "Park", "Choi",
+
+    // Filipino
+    "Santos", "Reyes", "Garcia", "Cruz",
+
+    // Anglo / general NZ
+    "Smith", "Jones", "Brown", "Wilson", "Taylor", "Martin",
+    "Thompson", "Wright", "Mason", "Reed", "Walker", "McKenzie",
+    "Anderson", "Campbell", "Young",
+];
 const FILE_SUFFIXES: &[&str] = &["Draft", "For Review", "Approved", "Working Copy", "Final", "Updated", "Signed Off"];
 
 struct BusinessProfile { division: &'static str, department: &'static str, team: &'static str, process: &'static str, code: &'static str }

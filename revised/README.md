@@ -53,7 +53,7 @@ Business profiles link divisions, departments, teams and processes. At depth 7, 
 
 Shallower files stop earlier; deeper paths add working-record folders. Depth varies from min(3, maximum) to the maximum. Names combine a record ID, a title appropriate to the business area and format, and a review status. Owners are labelled synthetic.
 
-The same seed and all the same settings in version 0.3.0 reproduce relative paths, file bytes, sizes and inventory. Run folder suffixes and filesystem creation/modification times may differ. Different versions need not reproduce earlier output. The app does not upload generated data.
+The same seed and all the same settings in version 0.3.1 reproduce relative paths, file bytes, sizes and inventory. Run folder suffixes and filesystem creation/modification times may differ. Different versions need not reproduce earlier output. The app does not upload generated data.
 
 ## Inventory
 
@@ -78,7 +78,7 @@ Each content file is written to a temporary sibling, flushed and then renamed in
 
 Windows file operations may block on OS/SMB timeouts before returning an error. The app cannot interrupt an outstanding Windows call; **Pause dataset** interrupts retry waiting and waits for any outstanding call/current file. The configured window is a retry budget, not a hard wall-clock timeout for a stalled OS call.
 
-Previously generated version 0.2.0 datasets have no saved checkpoints and cannot be resumed with this feature. Resume assumes the destination retains previously acknowledged files; it does not audit every completed file for subsequent external deletion or modification. Checkpoints belong to this generation format and should be resumed using the same app version.
+Previously generated version 0.2.0 datasets have no saved checkpoints and cannot be resumed with this feature. Resume assumes the destination retains previously acknowledged files; it does not audit every completed file for subsequent external deletion or modification. Version 0.3.1 uses the updated FIRST and LAST name lists for new datasets. Saved v0.3.0 jobs retain their original name pools when resumed, preserving their existing content sequence.
 
 ## Build and package on Windows
 
